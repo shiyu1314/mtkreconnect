@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <signal.h>
 #include <errno.h>
+#include <net/if.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <linux/wireless.h>
@@ -76,8 +77,13 @@ static int mtk_ioctl_set(int sock, const char *ifname, const char *fmt, ...) {
     wrq.u.data.flags = 0;
 
     ret = ioctl(sock, RTPRIV_IOCTL_SET, &wrq);
-    if (ret < 0)
-        printf("[MTK-WiFi] ioctl \"%s\" on %s failed: %s\n", buffer, ifname, strerror(errno));
+    if (ret < 0) {
+        /* 对包含明文密钥的命令脱敏，避免密码泄漏进 syslog */
+        if (strncmp(buffer, "ApCliWPAPSK=", 12) == 0)
+            printf("[MTK-WiFi] ioctl \"ApCliWPAPSK=***\" on %s failed: %s\n", ifname, strerror(errno));
+        else
+            printf("[MTK-WiFi] ioctl \"%s\" on %s failed: %s\n", buffer, ifname, strerror(errno));
+    }
     return ret;
 }
 
@@ -97,8 +103,11 @@ static bool is_connected(int sock, const char *ifname) {
     /* 第二重防御：仅在驱动标记 qual 已更新时才采信，避免陈旧零值误判 */
     struct iw_statistics stats;
     memset(&stats, 0, sizeof(stats));
+    memset(&wrq, 0, sizeof(wrq));
+    snprintf(wrq.ifr_name, sizeof(wrq.ifr_name), "%s", ifname);
     wrq.u.data.pointer = (char *)&stats;
     wrq.u.data.length = sizeof(stats);
+    wrq.u.data.flags = 0;
 
     if (ioctl(sock, SIOCGIWSTATS, &wrq) >= 0) {
         if ((stats.qual.updated & IW_QUAL_QUAL_UPDATED) && stats.qual.qual == 0)
@@ -141,6 +150,32 @@ static void map_encryption(const char *uci_enc, char *auth, char *enc) {
     }
 }
 
+static void resolve_parent(struct uci_context *ctx, struct uci_package *pkg,
+                           const char *devname, const char *ifname, char *parent) {
+    /* 优先根据 wifi-device 段的 band/hwmode 推断父接口，避免对 ifname 命名的脆弱依赖 */
+    struct uci_section *dsec = uci_lookup_section(ctx, pkg, devname);
+    if (dsec) {
+        struct uci_option *band = uci_lookup_option(ctx, dsec, "band");
+        if (band && band->v.string) {
+            if (strcmp(band->v.string, "5g") == 0) { strcpy(parent, "rax0"); return; }
+            if (strcmp(band->v.string, "2g") == 0) { strcpy(parent, "ra0"); return; }
+        }
+        struct uci_option *hwmode = uci_lookup_option(ctx, dsec, "hwmode");
+        if (hwmode && hwmode->v.string) {
+            if (strcmp(hwmode->v.string, "11a") == 0) { strcpy(parent, "rax0"); return; }
+            if (strcmp(hwmode->v.string, "11g") == 0 || strcmp(hwmode->v.string, "11b") == 0) {
+                strcpy(parent, "ra0");
+                return;
+            }
+        }
+    }
+    /* 回退：按 STA 接口名前缀推断（apclix* 为 5G，其余为 2.4G） */
+    if (strncmp(ifname, "apclix", 6) == 0)
+        strcpy(parent, "rax0");
+    else
+        strcpy(parent, "ra0");
+}
+
 static int load_sta_configs(struct uci_context *ctx, StaInterface *list) {
     struct uci_package *pkg = NULL;
     int count = 0;
@@ -162,7 +197,12 @@ static int load_sta_configs(struct uci_context *ctx, StaInterface *list) {
         struct uci_option *key = uci_lookup_option(ctx, s, "key");
         struct uci_option *enc = uci_lookup_option(ctx, s, "encryption");
 
-        if (dev && s_id && dev->v.string && s_id->v.string && count < MAX_STA) {
+        if (dev && s_id && dev->v.string && s_id->v.string) {
+            if (count >= MAX_STA) {
+                printf("[MTK-WiFi] Too many STA profiles (max %d), ignoring \"%s\"\n",
+                       MAX_STA, s_id->v.string);
+                continue;
+            }
             if (ifn && ifn->v.string) {
                 snprintf(list[count].ifname, sizeof(list[count].ifname), "%s", ifn->v.string);
             } else {
@@ -176,10 +216,7 @@ static int load_sta_configs(struct uci_context *ctx, StaInterface *list) {
                     strcpy(list[count].ifname, "apcli0");
             }
 
-            if (strncmp(list[count].ifname, "apclix", 6) == 0)
-                strcpy(list[count].parent, "rax0");
-            else
-                strcpy(list[count].parent, "ra0");
+            resolve_parent(ctx, pkg, dev->v.string, list[count].ifname, list[count].parent);
 
             snprintf(list[count].ssid, sizeof(list[count].ssid), "%s", s_id->v.string);
             snprintf(list[count].key, sizeof(list[count].key), "%s", key && key->v.string ? key->v.string : "");
@@ -194,17 +231,30 @@ static int load_sta_configs(struct uci_context *ctx, StaInterface *list) {
     return count;
 }
 
+/* fail_count 为已累计的失败次数(>=1)；第一次失败即退避 RECONNECT_COOLDOWN 秒 */
 static time_t next_cooldown(int fail_count) {
-    int shift = fail_count > MAX_BACKOFF_SHIFT ? MAX_BACKOFF_SHIFT : fail_count;
+    int shift = fail_count - 1;
+    if (shift < 0) shift = 0;
+    if (shift > MAX_BACKOFF_SHIFT) shift = MAX_BACKOFF_SHIFT;
     return RECONNECT_COOLDOWN * (1 << shift);
+}
+
+static void record_failure(StaInterface *iface, time_t now) {
+    iface->fail_count++;
+    iface->next_try = now + next_cooldown(iface->fail_count);
 }
 
 static void do_connect_transaction(int sock, StaInterface *iface, time_t now) {
     printf("[MTK-WiFi] Connecting %s -> SSID [%s] (attempt %d)\n",
            iface->ifname, iface->ssid, iface->fail_count + 1);
 
-    set_if_up(sock, iface->parent);
-    set_if_up(sock, iface->ifname);
+    /* 拉起父接口与 STA 接口；失败仅记录，由后续 ioctl 结果决定成败。
+     * 注意：apcli* 虚拟接口可能尚未被驱动创建（需 ApCliEnable 激活），
+     * 故拉起失败不能作为致命错误中止事务。 */
+    if (set_if_up(sock, iface->parent) < 0)
+        printf("[MTK-WiFi] Warning: failed to bring parent %s up\n", iface->parent);
+    if (set_if_up(sock, iface->ifname) < 0)
+        printf("[MTK-WiFi] Warning: failed to bring %s up (may not exist yet)\n", iface->ifname);
 
     if (iface->fail_count >= 1) {
         mtk_ioctl_set(sock, iface->ifname, "ApCliEnable=0");
@@ -221,8 +271,7 @@ static void do_connect_transaction(int sock, StaInterface *iface, time_t now) {
     mtk_ioctl_set(sock, iface->ifname, "ApCliAutoConnect=1");
     mtk_ioctl_set(sock, iface->ifname, "ApCliEnable=1");
 
-    iface->fail_count++;
-    iface->next_try = now + next_cooldown(iface->fail_count);
+    record_failure(iface, now);
 }
 
 int main(void) {
@@ -249,13 +298,18 @@ int main(void) {
 
         if (g_reload) {
             g_reload = 0;
-            uci_free_context(ctx);
-            ctx = uci_alloc_context();
-            count = ctx ? load_sta_configs(ctx, ifaces) : 0;
-            printf("[Daemon] Config reloaded. Active profiles: %d\n", count);
-            /* 重载后轻微错峰，兼顾 netifd 重建窗口与响应速度 */
-            for (int i = 0; i < count; i++)
-                ifaces[i].next_try = time(NULL) + 5 + i * 10;
+            struct uci_context *newctx = uci_alloc_context();
+            if (!newctx) {
+                printf("[Daemon] Failed to allocate UCI context on reload, keeping old config\n");
+            } else {
+                uci_free_context(ctx);
+                ctx = newctx;
+                count = load_sta_configs(ctx, ifaces);
+                printf("[Daemon] Config reloaded. Active profiles: %d\n", count);
+                /* 重载后轻微错峰，兼顾 netifd 重建窗口与响应速度 */
+                for (int i = 0; i < count; i++)
+                    ifaces[i].next_try = time(NULL) + 5 + i * 10;
+            }
         }
 
         for (int i = 0; i < count; i++) {
