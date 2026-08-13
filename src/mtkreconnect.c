@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <signal.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -45,6 +46,8 @@ static void install_signals(void) {
     sigaction(SIGINT, &sa, NULL);
     sa.sa_handler = handle_hup;
     sigaction(SIGHUP, &sa, NULL);
+    /* 守护进程写日志时若管道断裂会收到 SIGPIPE，忽略之以免被误杀 */
+    signal(SIGPIPE, SIG_IGN);
 }
 
 static int set_if_up(int sock, const char *ifname) {
@@ -67,8 +70,12 @@ static int mtk_ioctl_set(int sock, const char *ifname, const char *fmt, ...) {
     int ret;
 
     va_start(args, fmt);
-    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    int len = vsnprintf(buffer, sizeof(buffer), fmt, args);
     va_end(args);
+    if (len < 0 || (size_t)len >= sizeof(buffer)) {
+        printf("[MTK-WiFi] ioctl command too long for %s, skipping\n", ifname);
+        return -1;
+    }
 
     memset(&wrq, 0, sizeof(wrq));
     snprintf(wrq.ifr_name, sizeof(wrq.ifr_name), "%s", ifname);
@@ -132,21 +139,52 @@ static void map_encryption(const char *uci_enc, char *auth, char *enc) {
         strcpy(auth, "WPA2PSK"); strcpy(enc, "AES");
         return;
     }
-    if (strstr(uci_enc, "psk2") || strstr(uci_enc, "ccmp")) {
-        strcpy(auth, "WPA2PSK"); strcpy(enc, "AES");
-    } else if (strstr(uci_enc, "sae") || strstr(uci_enc, "wpa3")) {
-        if (strstr(uci_enc, "mixed"))
-            strcpy(auth, "WPA2PSKWPA3SAE");
-        else
-            strcpy(auth, "WPA3SAE");
+
+    /* 开放式网络：encryption 为 none/open 时无需加密，直接返回避免多余告警 */
+    if (strstr(uci_enc, "none") || strstr(uci_enc, "open")) {
+        strcpy(auth, "OPEN");
+        strcpy(enc, "NONE");
+        return;
+    }
+
+    const int sae   = strstr(uci_enc, "sae")   != NULL;
+    const int wpa3  = strstr(uci_enc, "wpa3")  != NULL;
+    const int psk2  = strstr(uci_enc, "psk2")  != NULL;
+    const int psk   = strstr(uci_enc, "psk")   != NULL;
+    const int mixed = strstr(uci_enc, "mixed") != NULL;
+    const int tkip  = strstr(uci_enc, "tkip")  != NULL;
+    const int aes   = strstr(uci_enc, "aes")   != NULL;
+    const int ccmp  = strstr(uci_enc, "ccmp")  != NULL;
+
+    if (sae || wpa3) {
+        /* WPA3-SAE，或 WPA2/WPA3 过渡模式（sae-mixed / psk2+ccmp+sae）。
+         * 必须先于 psk2 判断，否则 psk2+ccmp+sae 会被误判为纯 WPA2。 */
+        strcpy(auth, (mixed || psk2) ? "WPA2PSKWPA3SAE" : "WPA3SAE");
         strcpy(enc, "AES");
-    } else if (strstr(uci_enc, "psk")) {
-        strcpy(auth, "WPAPSK"); strcpy(enc, "TKIP");
     } else if (strstr(uci_enc, "owe")) {
-        strcpy(auth, "OWE"); strcpy(enc, "AES");
+        strcpy(auth, "OWE");
+        strcpy(enc, "AES");
+    } else if (psk || psk2 || ccmp) {
+        /* WPA/WPA2 PSK 系：区分混合模式与纯模式，并尊重 tkip/aes 加密后缀 */
+        if (mixed)
+            strcpy(auth, "WPA1PSKWPA2PSK");
+        else if (psk2 || ccmp)
+            strcpy(auth, "WPA2PSK");
+        else
+            strcpy(auth, "WPAPSK");
+
+        if (tkip && aes)
+            strcpy(enc, "TKIPAES");
+        else if (tkip)
+            strcpy(enc, "TKIP");
+        else if (mixed)
+            strcpy(enc, "TKIPAES");   /* psk-mixed 默认 TKIP+AES */
+        else
+            strcpy(enc, "AES");
     } else {
         printf("[MTK-WiFi] Unsupported encryption \"%s\", falling back to OPEN\n", uci_enc);
-        strcpy(auth, "OPEN"); strcpy(enc, "NONE");
+        strcpy(auth, "OPEN");
+        strcpy(enc, "NONE");
     }
 }
 
@@ -174,6 +212,8 @@ static void resolve_parent(struct uci_context *ctx, struct uci_package *pkg,
         strcpy(parent, "rax0");
     else
         strcpy(parent, "ra0");
+    printf("[MTK-WiFi] Warning: inferring parent %s for %s from ifname; "
+           "set band/hwmode or parent_iface to be explicit\n", parent, ifname);
 }
 
 static int load_sta_configs(struct uci_context *ctx, StaInterface *list) {
@@ -181,7 +221,10 @@ static int load_sta_configs(struct uci_context *ctx, StaInterface *list) {
     int count = 0;
 
     memset(list, 0, sizeof(StaInterface) * MAX_STA);
-    if (uci_load(ctx, "wireless", &pkg) != UCI_OK) return 0;
+    if (uci_load(ctx, "wireless", &pkg) != UCI_OK) {
+        printf("[MTK-WiFi] Failed to load wireless UCI config\n");
+        return 0;
+    }
 
     struct uci_element *e;
     uci_foreach_element(&pkg->sections, e) {
@@ -216,7 +259,11 @@ static int load_sta_configs(struct uci_context *ctx, StaInterface *list) {
                     strcpy(list[count].ifname, "apcli0");
             }
 
-            resolve_parent(ctx, pkg, dev->v.string, list[count].ifname, list[count].parent);
+            struct uci_option *pif = uci_lookup_option(ctx, s, "parent_iface");
+            if (pif && pif->v.string && pif->v.string[0])
+                snprintf(list[count].parent, sizeof(list[count].parent), "%s", pif->v.string);
+            else
+                resolve_parent(ctx, pkg, dev->v.string, list[count].ifname, list[count].parent);
 
             snprintf(list[count].ssid, sizeof(list[count].ssid), "%s", s_id->v.string);
             snprintf(list[count].key, sizeof(list[count].key), "%s", key && key->v.string ? key->v.string : "");
@@ -288,6 +335,8 @@ int main(void) {
         uci_free_context(ctx);
         return 1;
     }
+    /* 防止 socket 被 exec 的子进程意外继承 */
+    fcntl(sock, F_SETFD, FD_CLOEXEC);
 
     install_signals();
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -319,8 +368,11 @@ int main(void) {
                 ifaces[i].disconn_streak = 0;
             } else {
                 /* 滞回：连续两个 tick 判为断连才动作，过滤瞬时抖动 */
-                if (++ifaces[i].disconn_streak >= 2 && now >= ifaces[i].next_try)
+                if (++ifaces[i].disconn_streak >= 2 && now >= ifaces[i].next_try) {
                     do_connect_transaction(sock, &ifaces[i], now);
+                    /* 事务后清零滞回计数：next_try 已退避，避免长期断连时计数无限增长(理论上会溢出) */
+                    ifaces[i].disconn_streak = 0;
+                }
             }
         }
         sleep(TICK_INTERVAL);
