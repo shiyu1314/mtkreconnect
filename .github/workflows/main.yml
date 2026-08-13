@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      sdk_version:
+        description: '编译SDK版本'
+        required: true
+        default: '25.12.0'
+        type: choice
+        options:
+        - 25.12.0
+      build_flags:
+        description: '编译选项'
+        required: false
+        type: string
+        default: 'V=s'
+
+jobs:
+  build:
+    name: Build with ${{ inputs.sdk_version }} ${{ inputs.build_flags }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Environment info
+        run: |
+          TAG="$(date +'%Y%m%d')-$(openssl rand -hex 3)"
+          echo "tag=$TAG" >> $GITHUB_ENV
+          echo -e "Total CPU cores\t: $(nproc)"
+          grep -m1 model /proc/cpuinfo
+          free -h
+          uname -a
+          [ -f /proc/version ] && cat /proc/version
+          [ -f /etc/issue.net ] && cat /etc/issue.net
+          ulimit -a
+
+      - name: Download OpenWRT SDK v${{ inputs.sdk_version }}
+        run: |
+          wget -rLl1 -nd -P ${{ runner.tool_cache }}/openwrt-sdk --reject-regex /$ --progress=dot:giga \
+            https://archive.openwrt.org/releases/${{ inputs.sdk_version }}/targets/mediatek/filogic/ -A openwrt-sdk-*.tar.*
+          cd ${{ runner.tool_cache }}/openwrt-sdk
+          tar --strip-components=1 -xf openwrt-sdk-*.tar.*
+          rm openwrt-sdk-*.tar.*
+
+      - name: Install feeds
+        working-directory: '${{ runner.tool_cache }}/openwrt-sdk'
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        working-directory: '${{ runner.tool_cache }}/openwrt-sdk'
+        run: |
+          ln -sf $GITHUB_WORKSPACE package/mtkreconnect
+          echo "CONFIG_PACKAGE_mtkreconnect=y" >> .config
+          make defconfig
+
+      - name: Build
+        id: build
+        working-directory: '${{ runner.tool_cache }}/openwrt-sdk'
+        run: |
+          make package/mtkreconnect/compile -j$(nproc) ${{ inputs.build_flags }}
+          TARGET=$(echo bin/packages/aarch64_cortex-a53/base/mtkreconnect*.*)
+          echo "TARGET=$(pwd)/$TARGET" | tee -a $GITHUB_OUTPUT
+          
+          
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2.1.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{env.tag}}
+          files: ${{ steps.build.outputs.TARGET }}
+
+      - name: Delete old releases
+        uses: dev-drprasad/delete-older-releases@v0.3.4
+        with:
+          keep_latest: 1
+          delete_tags: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
+
+
