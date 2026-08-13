@@ -393,6 +393,7 @@ int main(void) {
                 /* 重载后轻微错峰，兼顾 netifd 重建窗口与响应速度 */
                 for (int i = 0; i < count; i++) {
                     ifaces[i].next_try = mono_now() + 5 + i * 10;
+                    ifaces[i].disconn_streak = 0;
                 }
             }
         }
