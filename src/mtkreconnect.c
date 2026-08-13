@@ -19,6 +19,7 @@
 #define RECONNECT_COOLDOWN 45
 #define MAX_BACKOFF_SHIFT 4
 #define TICK_INTERVAL 5
+#define RECONNECT_JITTER 5
 
 typedef struct {
     char ifname[IFNAMSIZ];
@@ -48,6 +49,19 @@ static void install_signals(void) {
     sigaction(SIGHUP, &sa, NULL);
     /* 守护进程写日志时若管道断裂会收到 SIGPIPE，忽略之以免被误杀 */
     signal(SIGPIPE, SIG_IGN);
+}
+
+/* 带边界的安全拷贝：始终以 '\0' 结尾，超长截断（snprintf 语义，规避 strncpy 不补 '\0' 的坑） */
+static void safe_copy(char *dst, size_t dst_size, const char *src) {
+    if (dst_size > 0)
+        snprintf(dst, dst_size, "%s", src);
+}
+
+/* 单调时钟秒数：不受系统时间跳变(NTP/手动改时)影响，用于重连退避计时 */
+static time_t mono_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec;
 }
 
 static int set_if_up(int sock, const char *ifname) {
@@ -134,16 +148,17 @@ static bool is_connected(int sock, const char *ifname) {
     return true;
 }
 
-static void map_encryption(const char *uci_enc, char *auth, char *enc) {
+static void map_encryption(const char *uci_enc, char *auth, size_t auth_size,
+                           char *enc, size_t enc_size) {
     if (!uci_enc) {
-        strcpy(auth, "WPA2PSK"); strcpy(enc, "AES");
+        safe_copy(auth, auth_size, "WPA2PSK"); safe_copy(enc, enc_size, "AES");
         return;
     }
 
     /* 开放式网络：encryption 为 none/open 时无需加密，直接返回避免多余告警 */
     if (strstr(uci_enc, "none") || strstr(uci_enc, "open")) {
-        strcpy(auth, "OPEN");
-        strcpy(enc, "NONE");
+        safe_copy(auth, auth_size, "OPEN");
+        safe_copy(enc, enc_size, "NONE");
         return;
     }
 
@@ -159,59 +174,60 @@ static void map_encryption(const char *uci_enc, char *auth, char *enc) {
     if (sae || wpa3) {
         /* WPA3-SAE，或 WPA2/WPA3 过渡模式（sae-mixed / psk2+ccmp+sae）。
          * 必须先于 psk2 判断，否则 psk2+ccmp+sae 会被误判为纯 WPA2。 */
-        strcpy(auth, (mixed || psk2) ? "WPA2PSKWPA3SAE" : "WPA3SAE");
-        strcpy(enc, "AES");
+        safe_copy(auth, auth_size, (mixed || psk2) ? "WPA2PSKWPA3SAE" : "WPA3SAE");
+        safe_copy(enc, enc_size, "AES");
     } else if (strstr(uci_enc, "owe")) {
-        strcpy(auth, "OWE");
-        strcpy(enc, "AES");
+        safe_copy(auth, auth_size, "OWE");
+        safe_copy(enc, enc_size, "AES");
     } else if (psk || psk2 || ccmp) {
         /* WPA/WPA2 PSK 系：区分混合模式与纯模式，并尊重 tkip/aes 加密后缀 */
         if (mixed)
-            strcpy(auth, "WPA1PSKWPA2PSK");
+            safe_copy(auth, auth_size, "WPA1PSKWPA2PSK");
         else if (psk2 || ccmp)
-            strcpy(auth, "WPA2PSK");
+            safe_copy(auth, auth_size, "WPA2PSK");
         else
-            strcpy(auth, "WPAPSK");
+            safe_copy(auth, auth_size, "WPAPSK");
 
         if (tkip && aes)
-            strcpy(enc, "TKIPAES");
+            safe_copy(enc, enc_size, "TKIPAES");
         else if (tkip)
-            strcpy(enc, "TKIP");
+            safe_copy(enc, enc_size, "TKIP");
         else if (mixed)
-            strcpy(enc, "TKIPAES");   /* psk-mixed 默认 TKIP+AES */
+            safe_copy(enc, enc_size, "TKIPAES");   /* psk-mixed 默认 TKIP+AES */
         else
-            strcpy(enc, "AES");
+            safe_copy(enc, enc_size, "AES");
     } else {
         printf("[MTK-WiFi] Unsupported encryption \"%s\", falling back to OPEN\n", uci_enc);
-        strcpy(auth, "OPEN");
-        strcpy(enc, "NONE");
+        safe_copy(auth, auth_size, "OPEN");
+        safe_copy(enc, enc_size, "NONE");
     }
 }
 
 static void resolve_parent(struct uci_context *ctx, struct uci_package *pkg,
-                           const char *devname, const char *ifname, char *parent) {
+                           const char *devname, const char *ifname, char *parent,
+                           size_t parent_size) {
     /* 优先根据 wifi-device 段的 band/hwmode 推断父接口，避免对 ifname 命名的脆弱依赖 */
     struct uci_section *dsec = uci_lookup_section(ctx, pkg, devname);
     if (dsec) {
         struct uci_option *band = uci_lookup_option(ctx, dsec, "band");
         if (band && band->v.string) {
-            if (strcmp(band->v.string, "5g") == 0) { strcpy(parent, "rax0"); return; }
-            if (strcmp(band->v.string, "2g") == 0) { strcpy(parent, "ra0"); return; }
+            if (strcmp(band->v.string, "5g") == 0) { safe_copy(parent, parent_size, "rax0"); return; }
+            if (strcmp(band->v.string, "2g") == 0) { safe_copy(parent, parent_size, "ra0"); return; }
         }
         struct uci_option *hwmode = uci_lookup_option(ctx, dsec, "hwmode");
         if (hwmode && hwmode->v.string) {
-            if (strcmp(hwmode->v.string, "11a") == 0) { strcpy(parent, "rax0"); return; }
+            if (strcmp(hwmode->v.string, "11a") == 0) { safe_copy(parent, parent_size, "rax0"); return; }
             if (strcmp(hwmode->v.string, "11g") == 0 || strcmp(hwmode->v.string, "11b") == 0) {
-                strcpy(parent, "ra0");
+                safe_copy(parent, parent_size, "ra0");
                 return;
             }
         }
     }
     /* 回退：按 STA 接口名前缀推断（apclix* 为 5G，其余为 2.4G） */
     if (strncmp(ifname, "apclix", 6) == 0)
-        strcpy(parent, "rax0");
+        safe_copy(parent, parent_size, "rax0");
     else
-        strcpy(parent, "ra0");
+        safe_copy(parent, parent_size, "ra0");
     printf("[MTK-WiFi] Warning: inferring parent %s for %s from ifname; "
            "set band/hwmode or parent_iface to be explicit\n", parent, ifname);
 }
@@ -254,20 +270,23 @@ static int load_sta_configs(struct uci_context *ctx, StaInterface *list) {
                 size_t devlen = strlen(devname);
                 char devlast = devlen ? devname[devlen - 1] : '\0';
                 if (strstr(devname, "rax") || (devlast >= '1' && devlast <= '9'))
-                    strcpy(list[count].ifname, "apclix0");
+                    safe_copy(list[count].ifname, sizeof(list[count].ifname), "apclix0");
                 else
-                    strcpy(list[count].ifname, "apcli0");
+                    safe_copy(list[count].ifname, sizeof(list[count].ifname), "apcli0");
             }
 
             struct uci_option *pif = uci_lookup_option(ctx, s, "parent_iface");
             if (pif && pif->v.string && pif->v.string[0])
                 snprintf(list[count].parent, sizeof(list[count].parent), "%s", pif->v.string);
             else
-                resolve_parent(ctx, pkg, dev->v.string, list[count].ifname, list[count].parent);
+                resolve_parent(ctx, pkg, dev->v.string, list[count].ifname, list[count].parent,
+                               sizeof(list[count].parent));
 
             snprintf(list[count].ssid, sizeof(list[count].ssid), "%s", s_id->v.string);
             snprintf(list[count].key, sizeof(list[count].key), "%s", key && key->v.string ? key->v.string : "");
-            map_encryption(enc ? enc->v.string : NULL, list[count].auth, list[count].enc);
+            map_encryption(enc ? enc->v.string : NULL,
+                           list[count].auth, sizeof(list[count].auth),
+                           list[count].enc, sizeof(list[count].enc));
 
             list[count].next_try = 0;
             list[count].fail_count = 0;
@@ -288,10 +307,13 @@ static time_t next_cooldown(int fail_count) {
 
 static void record_failure(StaInterface *iface, time_t now) {
     iface->fail_count++;
-    iface->next_try = now + next_cooldown(iface->fail_count);
+    /* 叠加小范围随机抖动，避免多接口同步重试造成并发 ioctl 突发 */
+    iface->next_try = now + next_cooldown(iface->fail_count) + (rand() % RECONNECT_JITTER);
 }
 
 static void do_connect_transaction(int sock, StaInterface *iface, time_t now) {
+    int failed = 0, total = 0;
+
     printf("[MTK-WiFi] Connecting %s -> SSID [%s] (attempt %d)\n",
            iface->ifname, iface->ssid, iface->fail_count + 1);
 
@@ -304,19 +326,31 @@ static void do_connect_transaction(int sock, StaInterface *iface, time_t now) {
         printf("[MTK-WiFi] Warning: failed to bring %s up (may not exist yet)\n", iface->ifname);
 
     if (iface->fail_count >= 1) {
-        mtk_ioctl_set(sock, iface->ifname, "ApCliEnable=0");
+        if (mtk_ioctl_set(sock, iface->ifname, "ApCliEnable=0") < 0) failed++;
+        total++;
         usleep(500000);
     }
 
-    mtk_ioctl_set(sock, iface->ifname, "ApCliAuthMode=%s", iface->auth);
-    mtk_ioctl_set(sock, iface->ifname, "ApCliEncrypType=%s", iface->enc);
-    if (strlen(iface->key) > 0)
-        mtk_ioctl_set(sock, iface->ifname, "ApCliWPAPSK=%s", iface->key);
+    if (mtk_ioctl_set(sock, iface->ifname, "ApCliAuthMode=%s", iface->auth) < 0) failed++;
+    total++;
+    if (mtk_ioctl_set(sock, iface->ifname, "ApCliEncrypType=%s", iface->enc) < 0) failed++;
+    total++;
+    if (strlen(iface->key) > 0) {
+        if (mtk_ioctl_set(sock, iface->ifname, "ApCliWPAPSK=%s", iface->key) < 0) failed++;
+        total++;
+    }
 
-    mtk_ioctl_set(sock, iface->ifname, "ApCliSsid=%s", iface->ssid);
+    if (mtk_ioctl_set(sock, iface->ifname, "ApCliSsid=%s", iface->ssid) < 0) failed++;
+    total++;
 
-    mtk_ioctl_set(sock, iface->ifname, "ApCliAutoConnect=1");
-    mtk_ioctl_set(sock, iface->ifname, "ApCliEnable=1");
+    if (mtk_ioctl_set(sock, iface->ifname, "ApCliAutoConnect=1") < 0) failed++;
+    total++;
+    if (mtk_ioctl_set(sock, iface->ifname, "ApCliEnable=1") < 0) failed++;
+    total++;
+
+    if (failed > 0)
+        printf("[MTK-WiFi] %s: %d/%d ioctl commands failed during reconnect\n",
+               iface->ifname, failed, total);
 
     record_failure(iface, now);
 }
@@ -328,7 +362,7 @@ int main(void) {
     StaInterface ifaces[MAX_STA];
     int count = load_sta_configs(ctx, ifaces);
     for (int i = 0; i < count; i++)
-        ifaces[i].next_try = time(NULL) + i * 15; /* 启动错峰，避免并发扫描 */
+        ifaces[i].next_try = mono_now() + i * 15; /* 启动错峰，避免并发扫描 */
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
@@ -339,11 +373,12 @@ int main(void) {
     fcntl(sock, F_SETFD, FD_CLOEXEC);
 
     install_signals();
+    srand(time(NULL)); /* 为退避抖动提供种子(非加密用途) */
     setvbuf(stdout, NULL, _IOLBF, 0);
     printf("[Daemon] MTK WiFi monitor started. Active profiles: %d\n", count);
 
     while (!g_stop) {
-        time_t now = time(NULL);
+        time_t now = mono_now();
 
         if (g_reload) {
             g_reload = 0;
@@ -357,7 +392,7 @@ int main(void) {
                 printf("[Daemon] Config reloaded. Active profiles: %d\n", count);
                 /* 重载后轻微错峰，兼顾 netifd 重建窗口与响应速度 */
                 for (int i = 0; i < count; i++)
-                    ifaces[i].next_try = time(NULL) + 5 + i * 10;
+                    ifaces[i].next_try = mono_now() + 5 + i * 10;
             }
         }
 
