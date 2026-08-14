@@ -20,6 +20,11 @@
 #define MAX_BACKOFF_SHIFT 4
 #define TICK_INTERVAL 5
 #define RECONNECT_JITTER 5
+/* 连续多少个 tick(每 tick 5s) 判为在线才确认连接。
+ * MTK 驱动在 ApCliEnable=1 后约 15-30s 内会短暂上报目标 BSSID 与
+ * 残留速率，造成假连接；确认窗口须覆盖该时段(留余量取 40s)，
+ * 防止假连接把 fail_count 与退避 next_try 清零后立刻重试。 */
+#define CONNECT_CONFIRM_TICKS 8
 
 typedef struct {
     char ifname[IFNAMSIZ];
@@ -31,6 +36,8 @@ typedef struct {
     time_t next_try;
     int fail_count;
     int disconn_streak;
+    int connected_streak;
+    int last_connected;   /* 0 断连, 1 在线，用于状态转换日志 */
 } StaInterface;
 
 static volatile sig_atomic_t g_reload;
@@ -235,11 +242,23 @@ static void resolve_parent(struct uci_context *ctx, struct uci_package *pkg,
 static int load_sta_configs(struct uci_context *ctx, StaInterface *list) {
     struct uci_package *pkg = NULL;
     int count = 0;
+    StaInterface old[MAX_STA];
+    int old_count = 0;
+
+    /* 备份旧配置的运行状态（退避/失败计数），重载后按 ifname+ssid 恢复，
+     * 避免 UCI 重载（SIGHUP）把冷却与失败计数清零，导致退避被反复打断 */
+    memset(old, 0, sizeof(old));
+    for (int i = 0; i < MAX_STA && old_count < MAX_STA; i++) {
+        if (list[i].ssid[0])
+            old[old_count++] = list[i];
+    }
 
     memset(list, 0, sizeof(StaInterface) * MAX_STA);
     if (uci_load(ctx, "wireless", &pkg) != UCI_OK) {
         printf("[MTK-WiFi] Failed to load wireless UCI config\n");
-        return 0;
+        /* 载入失败时保留旧配置与运行状态，避免 daemon 退化为 0 个 profile */
+        memcpy(list, old, sizeof(old));
+        return old_count;
     }
 
     struct uci_element *e;
@@ -294,6 +313,21 @@ static int load_sta_configs(struct uci_context *ctx, StaInterface *list) {
         }
     }
     uci_unload(ctx, pkg);
+
+    /* 恢复匹配 profile 的运行状态（ifname+ssid 相同视为同一接口） */
+    for (int i = 0; i < count; i++) {
+        for (int j = 0; j < old_count; j++) {
+            if (strcmp(list[i].ifname, old[j].ifname) == 0 &&
+                strcmp(list[i].ssid, old[j].ssid) == 0) {
+                list[i].next_try = old[j].next_try;
+                list[i].fail_count = old[j].fail_count;
+                list[i].disconn_streak = old[j].disconn_streak;
+                list[i].connected_streak = old[j].connected_streak;
+                list[i].last_connected = old[j].last_connected;
+                break;
+            }
+        }
+    }
     return count;
 }
 
@@ -359,10 +393,15 @@ int main(void) {
     struct uci_context *ctx = uci_alloc_context();
     if (!ctx) return 1;
 
-    StaInterface ifaces[MAX_STA];
+    StaInterface ifaces[MAX_STA] = {{0}};
     int count = load_sta_configs(ctx, ifaces);
-    for (int i = 0; i < count; i++)
+    for (int i = 0; i < count; i++) {
         ifaces[i].next_try = mono_now() + i * 15; /* 启动错峰，避免并发扫描 */
+        /* 打印映射后的认证配置（不含密钥明文），便于排查加密方式映射错误 */
+        printf("[MTK-WiFi] Profile %s: SSID [%s] auth=%s enc=%s key=%s\n",
+               ifaces[i].ifname, ifaces[i].ssid, ifaces[i].auth, ifaces[i].enc,
+               ifaces[i].key[0] ? "set" : "empty");
+    }
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
@@ -390,20 +429,42 @@ int main(void) {
                 ctx = newctx;
                 count = load_sta_configs(ctx, ifaces);
                 printf("[Daemon] Config reloaded. Active profiles: %d\n", count);
-                /* 重载后轻微错峰，兼顾 netifd 重建窗口与响应速度 */
+                /* 重载后轻微错峰，兼顾 netifd 重建窗口与响应速度。
+                 * 既有接口的退避节奏由 load_sta_configs 恢复，这里仅对
+                 * 无待执行退避的接口重新排期，避免重载清零冷却。 */
                 for (int i = 0; i < count; i++) {
-                    ifaces[i].next_try = mono_now() + 5 + i * 10;
+                    if (now >= ifaces[i].next_try)
+                        ifaces[i].next_try = now + 5 + i * 10;
                     ifaces[i].disconn_streak = 0;
+                    ifaces[i].connected_streak = 0;
                 }
             }
         }
 
         for (int i = 0; i < count; i++) {
-            if (is_connected(sock, ifaces[i].ifname)) {
-                ifaces[i].next_try = 0;
-                ifaces[i].fail_count = 0;
+            bool conn = is_connected(sock, ifaces[i].ifname);
+
+            /* 状态转换日志：驱动/链路状态翻转时输出，便于诊断假连接窗口 */
+            if (conn != ifaces[i].last_connected) {
+                printf("[MTK-WiFi] %s: link %s\n", ifaces[i].ifname, conn ? "up" : "down");
+                ifaces[i].last_connected = conn ? 1 : 0;
+            }
+
+            if (conn) {
+                /* 连续多个 tick 判为在线且退避期已过，才确认连接并清空
+                 * 失败计数与退避。驱动在关联后短暂上报 BSSID/速率造成假连接
+                 * 时，退避期未过则不清零，避免以 "(attempt 1)" 疯狂重试 */
+                if (++ifaces[i].connected_streak >= CONNECT_CONFIRM_TICKS &&
+                    now >= ifaces[i].next_try) {
+                    if (ifaces[i].fail_count != 0 || ifaces[i].next_try != 0)
+                        printf("[MTK-WiFi] %s: link confirmed stable, retry state reset\n",
+                               ifaces[i].ifname);
+                    ifaces[i].next_try = 0;
+                    ifaces[i].fail_count = 0;
+                }
                 ifaces[i].disconn_streak = 0;
             } else {
+                ifaces[i].connected_streak = 0;
                 /* 滞回：连续两个 tick 判为断连才动作，过滤瞬时抖动 */
                 if (++ifaces[i].disconn_streak >= 2 && now >= ifaces[i].next_try) {
                     do_connect_transaction(sock, &ifaces[i], now);
