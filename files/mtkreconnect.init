@@ -6,10 +6,11 @@ USE_PROCD=1
 . /lib/functions.sh
 
 check_sta() {
-	local mode
+	local mode disabled
 
 	config_get mode "$1" mode
-	[ "$mode" = "sta" ] && found=1
+	config_get_bool disabled "$1" disabled 0
+	[ "$mode" = "sta" ] && [ "$disabled" = "0" ] && found=1
 }
 
 start_service() {
@@ -33,9 +34,19 @@ service_triggers() {
 }
 
 reload_service() {
+	local found=0
+
+	config_load wireless
+	config_foreach check_sta wifi-iface
+
 	if procd_running mtkreconnect; then
-		procd_send_signal mtkreconnect
+		if [ "$found" = "0" ]; then
+			# 所有 STA 接口均已 disabled，停止守护进程
+			stop
+		else
+			procd_send_signal mtkreconnect
+		fi
 	else
-		start
+		[ "$found" = "1" ] && start
 	fi
 }
