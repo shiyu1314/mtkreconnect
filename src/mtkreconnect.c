@@ -284,14 +284,31 @@ static int load_sta_configs(struct uci_context *ctx, StaInterface *list) {
             if (ifn && ifn->v.string) {
                 snprintf(list[count].ifname, sizeof(list[count].ifname), "%s", ifn->v.string);
             } else {
-                /* 按 radio 设备名末位数字推断：radio0/mt7981_0 -> 2.4G(apcli0)，radio1/mt7986_1 -> 5G(apclix0) */
-                const char *devname = dev->v.string;
-                size_t devlen = strlen(devname);
-                char devlast = devlen ? devname[devlen - 1] : '\0';
-                if (strstr(devname, "rax") || (devlast >= '1' && devlast <= '9'))
-                    safe_copy(list[count].ifname, sizeof(list[count].ifname), "apclix0");
-                else
-                    safe_copy(list[count].ifname, sizeof(list[count].ifname), "apcli0");
+                /* 与 resolve_parent 保持一致：优先按 wifi-device 段的 band/hwmode
+                 * 判定 2.4G/5G，避免 radio 段命名不规范（如把 2.4G 命名为 radio1/mt7981_1）
+                 * 时把 2.4G 误判成 5G，导致去操作 apclix0 而真正的中继接口 apcli0 从未被配置。 */
+                int is_5g = 0;
+                struct uci_section *dsec = uci_lookup_section(ctx, pkg, dev->v.string);
+                if (dsec) {
+                    struct uci_option *band = uci_lookup_option(ctx, dsec, "band");
+                    if (band && band->v.string) {
+                        if (strcmp(band->v.string, "5g") == 0) is_5g = 1;
+                    } else {
+                        struct uci_option *hwmode = uci_lookup_option(ctx, dsec, "hwmode");
+                        if (hwmode && hwmode->v.string &&
+                            strcmp(hwmode->v.string, "11a") == 0)
+                            is_5g = 1;
+                    }
+                } else {
+                    /* 兜底：无 radio 段可查时才按命名猜测 */
+                    const char *devname = dev->v.string;
+                    size_t devlen = strlen(devname);
+                    char devlast = devlen ? devname[devlen - 1] : '\0';
+                    if (strstr(devname, "rax") || (devlast >= '1' && devlast <= '9'))
+                        is_5g = 1;
+                }
+                safe_copy(list[count].ifname, sizeof(list[count].ifname),
+                          is_5g ? "apclix0" : "apcli0");
             }
 
             struct uci_option *pif = uci_lookup_option(ctx, s, "parent_iface");
